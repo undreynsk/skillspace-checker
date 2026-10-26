@@ -1,0 +1,10 @@
+[project]
+name = "skillspace-checker"
+version = "0.1.0"
+description = "Checks students' Python homework on Skillspace in a Docker sandbox"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "playwright>=1.64.1",
+    "python-dotenv>=1.2.4",
+]
