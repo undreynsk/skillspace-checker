@@ -7,18 +7,20 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from playwright.sync_api import APIRequestContext, Playwright, sync_playwright
 
-ROOT       = Path( __file__ ).parent
-TIME_LIMIT = 2  # AM 26/Oct/26 - seconds per test, as in the tasks
-SCORE      = "0"
-TASK_LIMIT = 4000  # AM 26/Oct/26 - max symbols of task description
-CODE_LIMIT = 8000  # AM 26/Oct/26 - max symbols of student code shown
-IMAGE      = "python:3.14-slim"
-DOCKER     = [ "wsl", "-d", "Ubuntu", "-e", "docker" ]  # AM 26/Oct/26 - Docker Engine inside WSL Ubuntu, not Docker Desktop
+ROOT         = Path( __file__ ).parent
+MEMORY_LIMIT = 64  # AM 02/Nov/26 - container memory cap in megabytes
+TIME_LIMIT   = 6  # AM 02/Nov/26 - safety stop for infinite loops in student code, seconds per test; not the task limit
+SCORE        = "0"
+TASK_LIMIT   = 4000  # AM 26/Oct/26 - max symbols of task description
+CODE_LIMIT   = 8000  # AM 26/Oct/26 - max symbols of student code shown
+IMAGE        = "python:3.14-slim"
+DOCKER       = [ "wsl", "-d", "Ubuntu", "-e", "docker" ]  # AM 26/Oct/26 - Docker Engine inside WSL Ubuntu, not Docker Desktop
 
 load_dotenv( ROOT / ".env" )
 URL       = os.getenv( "SKILLSPACE_URL", "" ).rstrip( "/" )
@@ -34,15 +36,22 @@ LIST_FILTERS = {
 DOCUMENT_QUERY = "query GetDocument($docId: ID!) { document(docId: $docId) { pages { content } } }"
 
 # AM 26/Oct/26 - runs the solution with input() that does not print its prompt, so stdout holds only the result
+# AM 02/Nov/26 - with --show-prompt (interactive run) the prompt is printed on its own line: the Far Manager console
+# AM 02/Nov/26 - does not show a line without a trailing newline, so a regular input() prompt stays invisible there
 RUNNER = """import builtins, runpy, sys
 
-def silent_input( prompt="" ):
+SHOW_PROMPT = "--show-prompt" in sys.argv
+
+def checker_input( prompt="" ):
+    if SHOW_PROMPT and prompt:
+        print( prompt, flush=True )
     line = sys.stdin.readline()
     if not line:
         raise EOFError( "EOF when reading a line" )
     return line.rstrip( "\\n" )
 
-builtins.input = silent_input
+builtins.input = checker_input
+sys.argv       = [ "solution.py" ]
 runpy.run_path( "solution.py", run_name="__main__" )
 """
 
@@ -153,29 +162,51 @@ def normalize( text: str ) -> str:
     return "\n".join( line.rstrip() for line in text.strip().splitlines() )
 
 
+# AM 26/Oct/26 - each test runs in a throwaway container: no network, memory cap, read-only, solution folder mounted read-only
+# AM 02/Nov/26 - tty=True attaches the teacher's keyboard and terminal for an interactive run
+def sandbox_command( folder: str, *program: str, tty: bool = False ) -> list[ str ]:
+    return DOCKER + [
+        "run", "--rm", "-it" if tty else "-i", "--network", "none",
+        "--memory", f"{MEMORY_LIMIT}m", "--memory-swap", f"{MEMORY_LIMIT}m",
+        "--cpus", "1", "--pids-limit", "64", "--read-only", "--tmpfs", "/tmp",
+        "--mount", f"type=bind,source={wsl_path(folder)},target=/code,readonly", "-w", "/code",
+        IMAGE, *program,
+    ]
+
+
+# AM 02/Nov/26 - run one test, drawing a progress bar towards TIME_LIMIT while waiting; returns stdout, stderr, exit code
+def run_with_progress( command: list[ str ], data: bytes | None, label: str ) -> tuple[ str, str, int ]:
+    process = subprocess.Popen( command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
+    start   = time.time()
+    while True:
+        try:
+            stdout, stderr = process.communicate( data, timeout=0.2 )
+            break
+        except subprocess.TimeoutExpired:
+            data   = None  # AM 02/Nov/26 - input is sent on the first call only, retries just keep waiting
+            filled = min( int( ( time.time() - start ) / TIME_LIMIT * 20 ), 20 )
+            print( f"\r  {label} [{'#' * filled}{'.' * (20 - filled)}]", end="", flush=True )
+    print( "\r" + " " * 40 + "\r", end="", flush=True )
+    return stdout.decode( "utf-8", "replace" ), stderr.decode( "utf-8", "replace" ), process.returncode
+
+
 # AM 26/Oct/26 - return problems found; an empty list means all tests passed with empty stderr
-# AM 26/Oct/26 - each test runs in a throwaway container: no network, 64Mb, read-only, solution folder mounted read-only
 def run_tests( code: str, tests: list[ tuple[ str, str ] ] ) -> list[ str ]:
     problems = []
     with tempfile.TemporaryDirectory() as folder:
         ( Path( folder ) / "solution.py" ).write_text( code, encoding="utf-8" )
         ( Path( folder ) / "runner.py" ).write_text( RUNNER, encoding="utf-8" )
-        command = DOCKER + [
-            "run", "--rm", "-i", "--network", "none", "--memory", "64m", "--memory-swap", "64m",
-            "--cpus", "1", "--pids-limit", "64", "--read-only", "--tmpfs", "/tmp",
-            "--mount", f"type=bind,source={wsl_path(folder)},target=/code,readonly", "-w", "/code",
-            IMAGE, "timeout", str( TIME_LIMIT ), "python", "-I", "-X", "utf8", "runner.py",
-        ]
+        command = sandbox_command( folder, "timeout", str( TIME_LIMIT ), "python", "-I", "-X", "utf8", "runner.py" )
         for number, ( stdin, expected ) in enumerate( tests, 1 ):
             # AM 26/Oct/26 - bytes, not text mode: on Windows text mode turns \n into \r\n and Linux input() keeps \r
-            result = subprocess.run( command, input=( stdin + "\n" ).encode( "utf-8" ), capture_output=True )
-            stdout = result.stdout.decode( "utf-8", "replace" )
-            stderr = result.stderr.decode( "utf-8", "replace" )
-            if result.returncode == 124:
-                problems.append( f"test {number}: time limit {TIME_LIMIT} s exceeded" )
+            stdout, stderr, returncode = run_with_progress( command, ( stdin + "\n" ).encode( "utf-8" ), f"test {number}" )
+            # AM 02/Nov/26 - 124: the timeout utility stopped the solution after TIME_LIMIT seconds
+            if returncode == 124:
+                problems.append( f"test {number}: stopped after {TIME_LIMIT} s, possibly an infinite loop" )
                 continue
-            if result.returncode == 137:
-                problems.append( f"test {number}: killed, most likely memory limit 64Mb exceeded" )
+            # AM 26/Oct/26 - 137 = 128 + 9 (SIGKILL): the kernel OOM killer stopped the container on the --memory cap
+            if returncode == 137:
+                problems.append( f"test {number}: killed, most likely memory limit {MEMORY_LIMIT}Mb exceeded" )
                 continue
             if stderr.strip():
                 problems.append( f"test {number}: stderr:\n{stderr.strip()}" )
@@ -184,14 +215,27 @@ def run_tests( code: str, tests: list[ tuple[ str, str ] ] ) -> list[ str ]:
     return problems
 
 
-def accept( api: APIRequestContext, work: dict, comment: str ):
-    response = api.post( "/api/rest/school/homework-user/answer", multipart={
-        "message":        f"<p>{html.escape(comment)}</p>",
-        "status":         "closed_good",
-        "homeworkUserId": str( work[ "id" ] ),
-        "score":          SCORE,
-    } )
-    print( "Accepted" if response.ok else f"Accept failed: HTTP {response.status} {response.text()[:300]}" )
+# AM 02/Nov/26 - run the solution with keyboard input and visible prompts, no time limit; Ctrl+C stops only this run
+def run_interactive( code: str ):
+    with tempfile.TemporaryDirectory() as folder:
+        ( Path( folder ) / "solution.py" ).write_text( code, encoding="utf-8" )
+        ( Path( folder ) / "runner.py" ).write_text( RUNNER, encoding="utf-8" )
+        print( "Running student code, Ctrl+C to stop" )
+        print( "-" * 80 )
+        try:
+            subprocess.run( sandbox_command( folder, "python", "-I", "-X", "utf8", "runner.py", "--show-prompt", tty=True ) )
+        except KeyboardInterrupt:
+            print( "\nStopped" )
+        print( "-" * 80 )
+
+
+# AM 02/Nov/26 - post a teacher answer: closed_good accepts the work, teacher_sent only comments and keeps it open
+def send_answer( api: APIRequestContext, work: dict, status: str, comment: str, done: str ):
+    fields = { "message": f"<p>{html.escape(comment)}</p>", "status": status, "homeworkUserId": str( work[ "id" ] ) }
+    if status == "closed_good":
+        fields[ "score" ] = SCORE
+    response = api.post( "/api/rest/school/homework-user/answer", multipart=fields )
+    print( done if response.ok else f"Failed: HTTP {response.status} {response.text()[:300]}" )
 
 
 def main():
@@ -233,8 +277,23 @@ def check_works():
             else:
                 print( f"VERDICT: all {len(tests)} tests passed" )
 
-            if input( "Accept? [y/N]: " ).strip().lower() == "y":
-                accept( api, work, input( "Comment (Enter for none): " ).strip() )
+            while True:
+                choice = input( "[y] accept   [c] comment   [r] run interactively   [Enter] skip: " ).strip().lower()
+                if choice == "r":
+                    run_interactive( code )
+                    continue
+                if choice == "y":
+                    send_answer( api, work, "closed_good", input( "Comment (Enter for none): " ).strip(), "Accepted" )
+                elif choice == "c":
+                    comment = input( "Comment: " ).strip()
+                    if not comment:
+                        print( "Empty comment, nothing sent" )
+                        continue
+                    send_answer( api, work, "teacher_sent", comment, "Comment sent, the work stays open" )
+                elif choice:
+                    print( f"Unknown choice: {choice!r}" )
+                    continue
+                break
         api.dispose()
 
 

@@ -11,9 +11,12 @@ in an isolated Docker container and lets the teacher accept the work from the co
 - Logs in through the site form (headless Chromium, Playwright) and calls the internal Skillspace API.
 - Tests are the input / output example tables from the task text.
 - Each test runs in a throwaway `python:3.14-slim` container: no network, 64 MB RAM,
-  2 s time limit, read-only filesystem. `input()` prompts are suppressed so only the result is compared.
-- For every work the tool shows the task, the student's code and the verdict, then asks
-  `Accept? [y/N]` and an optional comment.
+  read-only filesystem. A test is stopped after 6 s as a guard against infinite loops.
+  `input()` prompts are suppressed so only the result is compared.
+- For every work the tool shows the task, the student's code and the verdict, then offers
+  `[y] accept` (with an optional comment), `[c] comment` (without accepting, the work stays open),
+  `[r] run interactively` (the same sandbox,
+  prompts visible, input from the keyboard, Ctrl+C stops the run) or skip.
 
 ## Requirements
 

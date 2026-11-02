@@ -75,13 +75,15 @@ async def main():
         page    = await context.new_page()
         await page.goto( f"{URL}/school/courses" )
         try:
-            await page.fill( 'input[type="email"], input[name*="email" i]', EMAIL, timeout=15_000 )
-            await page.fill( 'input[type="password"]', PASSWORD )
-            await page.press( 'input[type="password"]', "Enter" )
+            # AM 02/Nov/26 - the login form opens from the "Вход" button, same as in checker.py
+            await page.get_by_text( "Вход", exact=True ).click()
+            await page.fill( 'input[name="emailOrLogin"]', EMAIL, timeout=15_000 )
+            await page.fill( 'input[name="password"]', PASSWORD )
+            await page.press( 'input[name="password"]', "Enter" )
         except Exception:
             print( "Login form not filled automatically, log in manually" )
 
-        await asyncio.to_thread( input, "Accept one correct work and comment on another one, then press Enter here: " )
+        await asyncio.to_thread( input, "Send a comment on one work WITHOUT accepting it, then press Enter here: " )
         STATE_FILE.parent.mkdir( exist_ok=True )
         await context.storage_state( path=STATE_FILE )
         await asyncio.gather( *tasks, return_exceptions=True )
