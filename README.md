@@ -13,10 +13,12 @@ in an isolated Docker container and lets the teacher accept the work from the co
 - Each test runs in a throwaway `python:3.14-slim` container: no network, 64 MB RAM,
   read-only filesystem. A test is stopped after 6 s as a guard against infinite loops.
   `input()` prompts are suppressed so only the result is compared.
-- For every work the tool shows the task, the student's code and the verdict, then offers
+- For every work the tool shows the task, the student's code and the verdict.
+  If all tests pass, the work is accepted automatically. Otherwise the tool offers
   `[y] accept` (with an optional comment), `[c] comment` (without accepting, the work stays open),
   `[r] run interactively` (the same sandbox,
   prompts visible, input from the keyboard, Ctrl+C stops the run) or skip.
+- Everything printed to the console, including the teacher's answers, is appended to `logs/checker.log`.
 
 ## Requirements
 

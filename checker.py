@@ -1,6 +1,7 @@
 # AM 26/Oct/26 - check homeworks waiting for review against the examples from the task and accept them on approval
 
 import html
+import io
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.sync_api import APIRequestContext, Playwright, sync_playwright
+from playwright.sync_api import APIRequestContext, Error, Playwright, sync_playwright
 
 ROOT         = Path( __file__ ).parent
 MEMORY_LIMIT = 64  # AM 02/Nov/26 - container memory cap in megabytes
@@ -21,6 +22,7 @@ TASK_LIMIT   = 4000  # AM 26/Oct/26 - max symbols of task description
 CODE_LIMIT   = 8000  # AM 26/Oct/26 - max symbols of student code shown
 IMAGE        = "python:3.14-slim"
 DOCKER       = [ "wsl", "-d", "Ubuntu", "-e", "docker" ]  # AM 26/Oct/26 - Docker Engine inside WSL Ubuntu, not Docker Desktop
+LOG_FILE     = ROOT / "logs" / "checker.log"
 
 load_dotenv( ROOT / ".env" )
 URL       = os.getenv( "SKILLSPACE_URL", "" ).rstrip( "/" )
@@ -54,6 +56,35 @@ builtins.input = checker_input
 sys.argv       = [ "solution.py" ]
 runpy.run_path( "solution.py", run_name="__main__" )
 """
+
+
+# AM 02/Nov/26 - copies everything printed to the console into the log file; progress bar redraws (starting with \r) are skipped
+class Tee( io.TextIOBase ):
+    def __init__( self, console, log ):
+        self.console = console
+        self.log     = log
+
+    def write( self, text: str ) -> int:
+        self.console.write( text )
+        if not text.startswith( "\r" ):
+            self.log.write( text )
+        return len( text )
+
+    def flush( self ):
+        self.console.flush()
+        self.log.flush()
+
+
+# AM 02/Nov/26 - first line of a Playwright error: the rest is the call log with session cookies, keep it out of the log
+def short_error( error: Error ) -> str:
+    return str( error ).splitlines()[ 0 ]
+
+
+# AM 02/Nov/26 - input() that also logs the answer typed by the teacher; the prompt is logged by Tee
+def ask( prompt: str ) -> str:
+    answer = input( prompt )
+    sys.stdout.log.write( answer + "\n" )
+    return answer
 
 
 # AM 26/Oct/26 - check Docker in WSL (WSL and dockerd start on the first call) and pull the image on the first run
@@ -135,7 +166,12 @@ def table_rows( node: dict ):
 # AM 26/Oct/26 - return task description and tests: the row after each "Ввод | Вывод" header
 def load_task( api: APIRequestContext, document_id: str ) -> tuple[ str, list[ tuple[ str, str ] ] ]:
     response = api.post( "/api/graphql", data={ "query": DOCUMENT_QUERY, "variables": { "docId": document_id } } )
-    doc      = { "content": [ page[ "content" ] for page in response.json()[ "data" ][ "document" ][ "pages" ] ] }
+    document = ( response.json().get( "data" ) or {} ).get( "document" )
+    # AM 08/Nov/26 - no document (GraphQL errors or an empty documentId): go on without the task, the teacher decides
+    if not document:
+        print( f"Task not loaded, documentId {document_id!r}: {response.text()[:300]}" )
+        return "", []
+    doc      = { "content": [ page[ "content" ] for page in document[ "pages" ] ] }
     rows     = list( table_rows( doc ) )
     tests    = [ ( rows[ i + 1 ][ 0 ], rows[ i + 1 ][ 1 ] ) for i, row in enumerate( rows[ :-1 ] ) if row == [ "Ввод", "Вывод" ] ]
     match    = re.search( r"Задача\s*\n(.+?)\n\s*Формат ввода", node_text( doc ), re.S )
@@ -199,7 +235,8 @@ def run_tests( code: str, tests: list[ tuple[ str, str ] ] ) -> list[ str ]:
         command = sandbox_command( folder, "timeout", str( TIME_LIMIT ), "python", "-I", "-X", "utf8", "runner.py" )
         for number, ( stdin, expected ) in enumerate( tests, 1 ):
             # AM 26/Oct/26 - bytes, not text mode: on Windows text mode turns \n into \r\n and Linux input() keeps \r
-            stdout, stderr, returncode = run_with_progress( command, ( stdin + "\n" ).encode( "utf-8" ), f"test {number}" )
+            # AM 02/Nov/26 - extra empty line at the end: solutions reading "until an empty line" stop there, not on EOF
+            stdout, stderr, returncode = run_with_progress( command, ( stdin + "\n\n" ).encode( "utf-8" ), f"test {number}" )
             # AM 02/Nov/26 - 124: the timeout utility stopped the solution after TIME_LIMIT seconds
             if returncode == 124:
                 problems.append( f"test {number}: stopped after {TIME_LIMIT} s, possibly an infinite loop" )
@@ -234,16 +271,31 @@ def send_answer( api: APIRequestContext, work: dict, status: str, comment: str, 
     fields = { "message": f"<p>{html.escape(comment)}</p>", "status": status, "homeworkUserId": str( work[ "id" ] ) }
     if status == "closed_good":
         fields[ "score" ] = SCORE
-    response = api.post( "/api/rest/school/homework-user/answer", multipart=fields )
+    # AM 02/Nov/26 - a network error (e.g. ECONNRESET) skips the work instead of crashing; if the server did not get it,
+    # AM 02/Nov/26 - the work stays waiting and comes back on the next run. No retry: it could post the answer twice
+    try:
+        response = api.post( "/api/rest/school/homework-user/answer", multipart=fields )
+    except Error as error:
+        print( f"Failed: {short_error(error)}" )
+        return
     print( done if response.ok else f"Failed: HTTP {response.status} {response.text()[:300]}" )
 
 
 def main():
+    LOG_FILE.parent.mkdir( exist_ok=True )
+    log        = LOG_FILE.open( "a", encoding="utf-8", buffering=1 )  # AM 02/Nov/26 - line buffered, a crash loses nothing
+    sys.stdout = Tee( sys.stdout, log )
+    sys.stderr = Tee( sys.stderr, log )
+    print( f"\n===== {time.strftime('%d/%b/%y %H:%M:%S')} =====" )
+
     if not ( URL and EMAIL and PASSWORD and SCHOOL_ID ):
         sys.exit( "Fill SKILLSPACE_URL, SKILLSPACE_SCHOOL_ID, SKILLSPACE_EMAIL and SKILLSPACE_PASSWORD in .env" )
 
     docker_prepare()
-    check_works()
+    try:
+        check_works()
+    except Error as error:
+        sys.exit( f"Stopped: {short_error(error)}" )
 
 
 def check_works():
@@ -276,16 +328,19 @@ def check_works():
                 print( "\n".join( problems ) )
             else:
                 print( f"VERDICT: all {len(tests)} tests passed" )
+                # AM 02/Nov/26 - all tests passed: accept without asking the teacher
+                send_answer( api, work, "closed_good", "", "Accepted automatically" )
+                continue
 
             while True:
-                choice = input( "[y] accept   [c] comment   [r] run interactively   [Enter] skip: " ).strip().lower()
+                choice = ask( "[y] accept   [c] comment   [r] run interactively   [Enter] skip: " ).strip().lower()
                 if choice == "r":
                     run_interactive( code )
                     continue
                 if choice == "y":
-                    send_answer( api, work, "closed_good", input( "Comment (Enter for none): " ).strip(), "Accepted" )
+                    send_answer( api, work, "closed_good", ask( "Comment (Enter for none): " ).strip(), "Accepted" )
                 elif choice == "c":
-                    comment = input( "Comment: " ).strip()
+                    comment = ask( "Comment: " ).strip()
                     if not comment:
                         print( "Empty comment, nothing sent" )
                         continue
