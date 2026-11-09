@@ -163,18 +163,40 @@ def table_rows( node: dict ):
         yield from table_rows( child )
 
 
+# AM 09/Nov/26 - HTML fragment from an Editor.js block to plain text, <br> becomes a line break
+def html_text( text: str ) -> str:
+    return html.unescape( re.sub( r"<[^>]+>", "", re.sub( r"<br\s*/?>", "\n", text ) ) )
+
+
+# AM 09/Nov/26 - lessons of version 2 have no document: the task is in pagesPublished as Editor.js blocks
+def editor_task( lesson: dict ) -> tuple[ str, list[ list[ str ] ] ]:
+    text, rows = "", []
+    for page in lesson.get( "pagesPublished" ) or []:
+        for block in page[ "content" ][ "blocks" ]:
+            data = block[ "data" ]
+            if block[ "type" ] == "table":
+                rows += [ [ html_text( cell ).strip() for cell in row ] for row in data[ "content" ] ]
+            elif "text" in data:
+                text += html_text( data[ "text" ] ) + "\n"
+    return text, rows
+
+
 # AM 26/Oct/26 - return task description and tests: the row after each "Ввод | Вывод" header
-def load_task( api: APIRequestContext, document_id: str ) -> tuple[ str, list[ tuple[ str, str ] ] ]:
-    response = api.post( "/api/graphql", data={ "query": DOCUMENT_QUERY, "variables": { "docId": document_id } } )
-    document = ( response.json().get( "data" ) or {} ).get( "document" )
-    # AM 08/Nov/26 - no document (GraphQL errors or an empty documentId): go on without the task, the teacher decides
-    if not document:
-        print( f"Task not loaded, documentId {document_id!r}: {response.text()[:300]}" )
-        return "", []
-    doc      = { "content": [ page[ "content" ] for page in document[ "pages" ] ] }
-    rows     = list( table_rows( doc ) )
-    tests    = [ ( rows[ i + 1 ][ 0 ], rows[ i + 1 ][ 1 ] ) for i, row in enumerate( rows[ :-1 ] ) if row == [ "Ввод", "Вывод" ] ]
-    match    = re.search( r"Задача\s*\n(.+?)\n\s*Формат ввода", node_text( doc ), re.S )
+def load_task( api: APIRequestContext, lesson: dict ) -> tuple[ str, list[ tuple[ str, str ] ] ]:
+    if lesson[ "documentId" ]:
+        response = api.post( "/api/graphql", data={ "query": DOCUMENT_QUERY, "variables": { "docId": lesson[ "documentId" ] } } )
+        document = ( response.json().get( "data" ) or {} ).get( "document" )
+        # AM 08/Nov/26 - no document (GraphQL errors): go on without the task, the teacher decides
+        if not document:
+            print( f"Task not loaded: {response.text()[:300]}" )
+            return "", []
+        doc  = { "content": [ page[ "content" ] for page in document[ "pages" ] ] }
+        text = node_text( doc )
+        rows = list( table_rows( doc ) )
+    else:
+        text, rows = editor_task( lesson )
+    tests = [ ( rows[ i + 1 ][ 0 ], rows[ i + 1 ][ 1 ] ) for i, row in enumerate( rows[ :-1 ] ) if row == [ "Ввод", "Вывод" ] ]
+    match = re.search( r"Задача\s*\n(.+?)\n\s*Формат ввода", text, re.S )
     return ( match.group( 1 ).strip() if match else "" ), tests
 
 
@@ -311,7 +333,7 @@ def check_works():
             print( f"{work['user']['name']} - {lesson['name']}" )
 
             print( "Loading task and student code..." )
-            description, tests = load_task( api, lesson[ "documentId" ] )
+            description, tests = load_task( api, lesson )
             code               = student_code( api, work )
             print( f"Running {len(tests)} tests..." )
             problems = run_tests( code, tests ) if tests and code else []
